@@ -337,7 +337,7 @@ impl RubySchemaBuilder {
         }
 
         if type_str.starts_with("fixed_len_byte_array(") && type_str.ends_with(')') {
-            let params = &type_str[20..type_str.len() - 1];
+            let params = &type_str[21..type_str.len() - 1];
             let len = params.parse::<i32>().map_err(|_| {
                 ParquetError::Schema(format!("Invalid fixed_len_byte_array length: {}", params))
             })?;
