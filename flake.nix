@@ -27,7 +27,7 @@
         flake-utils.follows = "flake-utils";
       };
     };
-    nixpkgs.url = "github:NixOS/nixpkgs/master";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs = {
@@ -90,7 +90,7 @@
           legacyPackages.nixpkgs = pkgs;
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
-              ruby_3_3
+              ruby_3_4
               duckdb
               bundler
               rust-analyzer-unwrapped
