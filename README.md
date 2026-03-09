@@ -6,6 +6,7 @@ Read and write [Apache Parquet](https://parquet.apache.org/) files from Ruby. Th
 
 - **High performance** columnar data storage and retrieval
 - **Memory-efficient** streaming APIs for large datasets
+- **Remote source support** for S3 and HTTP Range-based reads with row-group pruning
 - **Full compatibility** with the Apache Parquet specification
 - **Simple, Ruby-native** APIs that feel natural
 
@@ -363,6 +364,108 @@ schema = Parquet::Schema.define do
   field :original_tz, :string                              # "America/New_York"
 end
 ```
+
+## Reading from Remote Sources (S3, HTTP Range)
+
+You can read Parquet files directly from remote storage like AWS S3 without downloading the entire file. The reader uses Range GETs to fetch only the footer and the row groups you need.
+
+Any Ruby object that implements `byte_length` and `read_range(offset, length)` can be used as a source:
+
+```ruby
+class S3RangeSource
+  def initialize(bucket:, key:, s3: Aws::S3::Client.new, size: nil)
+    @bucket, @key, @s3, @size = bucket, key, s3, size
+  end
+
+  def byte_length
+    @size ||= @s3.head_object(bucket: @bucket, key: @key).content_length
+  end
+
+  def read_range(offset, length)
+    return "".b if length == 0
+    resp = @s3.get_object(
+      bucket: @bucket, key: @key,
+      range: "bytes=#{offset}-#{offset + length - 1}"
+    )
+    data = +""
+    resp.body.read(nil, out: data)
+    data
+  end
+end
+```
+
+Use it anywhere you'd pass a file path or IO:
+
+```ruby
+source = S3RangeSource.new(bucket: "my-bucket", key: "data/events.parquet")
+
+Parquet.each_row(source, columns: %w[id name]) do |row|
+  puts row
+end
+```
+
+### Row-Group Pruning
+
+Combine remote sources with row-group selection to minimize bytes transferred. If you know which row groups contain the data you need (from a catalog or by inspecting metadata), pass `row_groups:` to skip everything else:
+
+```ruby
+source = S3RangeSource.new(bucket: "my-bucket", key: "data/events.parquet")
+
+# Inspect metadata to find candidate row groups
+metadata = Parquet.metadata(source)
+row_groups = metadata["row_groups"] || []
+
+# Pick row groups whose stats cover a target value
+candidates = row_groups.filter_map do |rg|
+  stats = (rg["statistics"] || {})[0]  # column 0
+  next unless stats && stats["min_bytes"] && stats["max_bytes"]
+  min_v = stats["min_bytes"].byteslice(0, 8).unpack1("q<") rescue nil
+  max_v = stats["max_bytes"].byteslice(0, 8).unpack1("q<") rescue nil
+  (min_v && max_v && (min_v..max_v).cover?(42)) ? rg["ordinal"] : nil
+end
+
+# Fetch only the matching row groups
+rows = Parquet.each_row(
+  source,
+  columns: %w[id name],
+  row_groups: candidates
+).to_a
+```
+
+The `row_groups:` option also works with local files and column-wise reading:
+
+```ruby
+Parquet.each_column("data.parquet", columns: ["id"], row_groups: [0, 2]) do |batch|
+  # Only data from row groups 0 and 2
+end
+```
+
+## Incremental Writing with FileWriter
+
+`Parquet::FileWriter` gives you explicit control over row-group boundaries, which is useful when producing files optimized for S3 range reads or when you need to flush data at application-defined points (per shard, time window, etc.):
+
+```ruby
+schema = Parquet::Schema.define do
+  field :id, :int64, nullable: false
+  field :payload, :string
+end
+
+writer = Parquet::FileWriter.new(
+  schema: schema,
+  write_to: "output.parquet",
+  compression: "snappy",
+  row_group_target_bytes: 4 * 1024 * 1024  # ~4 MB per row group
+)
+
+writer.write_rows(first_batch)
+writer.flush_row_group          # seal the current row group
+writer.write_rows(second_batch)
+writer.close                    # writes the Parquet footer
+```
+
+- `row_group_target_bytes` automatically flushes when buffered data reaches the threshold.
+- `flush_row_group` explicitly seals a row group at any time.
+- `close` finalizes the file and writes the footer; always call it when done.
 
 ## Performance Tips
 
