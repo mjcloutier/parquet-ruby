@@ -126,12 +126,21 @@ impl ThreadSafeRemoteSource {
     }
 }
 
-/// Reader that serves a specific byte range using repeated remote fetches
+/// Minimum bytes to fetch per remote read. The parquet crate often calls read() with
+/// tiny buffers (1 byte), which would cause one S3 request per byte. We read-ahead
+/// to reduce network round-trips. 512KB = ~500 requests per 245MB file vs ~4000 at 64KB.
+const REMOTE_READ_AHEAD: usize = 512 * 1024; // 512KB
+
+/// Reader that serves a specific byte range using repeated remote fetches.
+/// Uses read-ahead to avoid excessive small reads (parquet often uses 1-byte buffers).
 pub(crate) struct RemoteRangeReader {
     source: ThreadSafeRemoteSource,
     start: u64,
     end: u64,
     pos: u64,
+    /// Read-ahead buffer: [buf_pos, buf_pos + buf_len) contains valid data
+    buf: Vec<u8>,
+    buf_pos: u64,
 }
 
 impl RemoteRangeReader {
@@ -141,6 +150,8 @@ impl RemoteRangeReader {
             start,
             end: start + length,
             pos: start,
+            buf: Vec::new(),
+            buf_pos: 0,
         }
     }
 }
@@ -152,7 +163,24 @@ impl Read for RemoteRangeReader {
             return Ok(0);
         }
 
-        let to_read = buf.len().min(remaining);
+        // Satisfy from read-ahead buffer if we have data
+        let buf_start = self.buf_pos;
+        let buf_end = buf_start + self.buf.len() as u64;
+        if self.pos >= buf_start && self.pos < buf_end {
+            let offset_in_buf = (self.pos - buf_start) as usize;
+            let available = self.buf.len() - offset_in_buf;
+            let to_copy = buf.len().min(available).min(remaining);
+            buf[..to_copy].copy_from_slice(&self.buf[offset_in_buf..offset_in_buf + to_copy]);
+            self.pos += to_copy as u64;
+            return Ok(to_copy);
+        }
+
+        // Fetch at least REMOTE_READ_AHEAD bytes (or remaining) to avoid tiny requests
+        let to_read = buf
+            .len()
+            .max(REMOTE_READ_AHEAD)
+            .min(remaining);
+
         let bytes = self
             .source
             .read_range(self.pos, to_read)
@@ -165,6 +193,16 @@ impl Read for RemoteRangeReader {
         let len = bytes.len().min(buf.len());
         buf[..len].copy_from_slice(&bytes[..len]);
         self.pos += len as u64;
+
+        // Store excess in read-ahead buffer for next read
+        if bytes.len() > buf.len() {
+            self.buf = bytes[buf.len()..].to_vec();
+            self.buf_pos = self.pos;
+        } else {
+            self.buf.clear();
+            self.buf_pos = 0;
+        }
+
         Ok(len)
     }
 }
@@ -203,6 +241,12 @@ impl Seek for RemoteRangeReader {
         }
 
         self.pos = new_pos;
+        // Invalidate read-ahead buffer when seeking outside it
+        let buf_end = self.buf_pos + self.buf.len() as u64;
+        if new_pos < self.buf_pos || new_pos >= buf_end {
+            self.buf.clear();
+            self.buf_pos = 0;
+        }
         Ok(self.pos - self.start)
     }
 }
